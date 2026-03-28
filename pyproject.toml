@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tv-ife-estimator"
+version = "0.1.0"
+description = "Structured pipeline for router family sales forecasting with direct and paper-inspired models."
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "openpyxl>=3.1",
+  "pandas>=2.2",
+  "scikit-learn>=1.4",
+]
+
+[project.scripts]
+tv-ife-estimator = "tv_ife_estimator.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

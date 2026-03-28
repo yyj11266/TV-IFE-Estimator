@@ -1,0 +1,18 @@
+# Project data and generated artifacts
+data/
+outputs/
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Tooling and OS files
+.DS_Store
+.idea/
+.vscode/
