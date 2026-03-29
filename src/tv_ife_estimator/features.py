@@ -6,6 +6,21 @@ import numpy as np
 import pandas as pd
 
 
+def _add_paper_feature_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add paper-track regressors that remain available at forecast time."""
+
+    asp_proxy = frame["asp"].fillna(frame["ref_price"])
+    discount_proxy = frame["asp"] / frame["ref_price"]
+    discount_proxy = discount_proxy.where(frame["asp"].notna(), 1.0)
+
+    frame["current_log_asp"] = np.log1p(asp_proxy)
+    frame["current_discount"] = discount_proxy
+    frame["current_price_gap"] = frame["current_log_asp"] - frame["log_ref_price"]
+    frame["current_discount_x_mesh"] = frame["current_discount"] * frame["mesh_flag"]
+    frame["current_discount_x_wifi"] = frame["current_discount"] * frame["wifi_gen"]
+    return frame
+
+
 def build_direct_training_frame(
     month_panel: pd.DataFrame,
     static_profile: pd.DataFrame,
@@ -111,11 +126,13 @@ def build_paper_training_frame(
     frame["target_month_index"] = grouped["month_index"].shift(-1)
     frame["source_month"] = frame["month"]
     frame["source_month_index"] = frame["month_index"]
-    frame["current_log_asp"] = np.log1p(frame["asp"])
-    frame["current_discount"] = frame["asp"] / frame["ref_price"]
+    frame = _add_paper_feature_columns(frame)
 
     usable = frame[frame["target_month"].notna()].copy()
-    usable["current_discount"] = usable["current_discount"].replace([np.inf, -np.inf], np.nan)
+    usable["current_discount"] = usable["current_discount"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    usable["current_price_gap"] = usable["current_price_gap"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    usable["current_discount_x_mesh"] = usable["current_discount_x_mesh"].replace([np.inf, -np.inf], np.nan)
+    usable["current_discount_x_wifi"] = usable["current_discount_x_wifi"].replace([np.inf, -np.inf], np.nan)
     return usable.reset_index(drop=True)
 
 
@@ -137,6 +154,9 @@ def build_paper_forecast_frame(
         raise ValueError(f"No paper-model forecast rows found for source month {source_month}.")
     source_rows["source_month"] = source_rows["month"]
     source_rows["source_month_index"] = source_rows["month_index"]
-    source_rows["current_log_asp"] = np.log1p(source_rows["asp"])
-    source_rows["current_discount"] = source_rows["asp"] / source_rows["ref_price"]
+    source_rows = _add_paper_feature_columns(source_rows)
+    source_rows["current_discount"] = source_rows["current_discount"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    source_rows["current_price_gap"] = source_rows["current_price_gap"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    source_rows["current_discount_x_mesh"] = source_rows["current_discount_x_mesh"].replace([np.inf, -np.inf], np.nan)
+    source_rows["current_discount_x_wifi"] = source_rows["current_discount_x_wifi"].replace([np.inf, -np.inf], np.nan)
     return source_rows.reset_index(drop=True)

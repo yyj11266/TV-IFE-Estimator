@@ -9,6 +9,7 @@ from .constants import (
     DEFAULT_TARGET_MONTHS,
     ENHANCED_FILENAME,
     FULL_MONTHS,
+    CORE_PAPER_NUMERIC_FEATURES,
     RAW_FILENAME,
 )
 
@@ -38,12 +39,22 @@ class PipelineConfig:
 
     full_months: tuple[str, ...] = FULL_MONTHS
     target_months: tuple[str, ...] = DEFAULT_TARGET_MONTHS
+    paper_feature_columns: tuple[str, ...] = CORE_PAPER_NUMERIC_FEATURES
     factor_candidates: tuple[int, ...] = ()
     paper_max_factor_count: int = 6
     paper_ic_penalty_variant: str = "rho2"
     direct_model_alpha: float = 1.0
     paper_model_alpha: float = 1e-6
-    paper_min_window: float = 2.0
+    paper_bandwidth_scale: float = 0.5
+    paper_min_window: float = 0.0
+    predictive_tv_ife_feature_columns: tuple[str, ...] = (
+        "log_prev_sales",
+        "log_prev_prev_sales",
+        "prev_sales_growth",
+    )
+    predictive_tv_ife_n_factors: int = 0
+    predictive_tv_ife_ridge_alpha: float = 3e-2
+    predictive_tv_ife_bandwidth_scale: float = 0.65
 
 
 def default_paths(root: str | Path | None = None) -> ProjectPaths:

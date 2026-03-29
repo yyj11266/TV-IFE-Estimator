@@ -95,13 +95,17 @@ def summarize_evaluation(evaluation: pd.DataFrame) -> pd.DataFrame:
 def _fit_paper_model(
     train_frame: pd.DataFrame,
     config: PipelineConfig,
+    n_factors: int | None = None,
+    feature_columns: tuple[str, ...] | None = None,
 ) -> tuple[PaperInspiredFactorForecaster, list[dict[str, float | int | str]]]:
     model = PaperInspiredFactorForecaster(
-        n_factors=None,
+        n_factors=n_factors,
+        feature_columns=feature_columns or config.paper_feature_columns,
         factor_candidates=config.factor_candidates,
         max_factor_count=config.paper_max_factor_count,
         ic_penalty_variant=config.paper_ic_penalty_variant,
         ridge_alpha=config.paper_model_alpha,
+        bandwidth_scale=config.paper_bandwidth_scale,
         min_window=config.paper_min_window,
     ).fit(train_frame)
     records = model.selection_table_.to_dict(orient="records") if model.selection_table_ is not None else []
@@ -109,6 +113,24 @@ def _fit_paper_model(
         record["selected_factor_count"] = model.selected_factor_count_
         record["selected"] = int(record["factor_count"] == model.selected_factor_count_)
     return model, records
+
+
+def _fit_predictive_tv_ife_model(
+    train_frame: pd.DataFrame,
+    config: PipelineConfig,
+) -> PaperInspiredFactorForecaster:
+    model = PaperInspiredFactorForecaster(
+        n_factors=config.predictive_tv_ife_n_factors,
+        feature_columns=config.predictive_tv_ife_feature_columns,
+        factor_candidates=config.factor_candidates,
+        max_factor_count=config.paper_max_factor_count,
+        ic_penalty_variant=config.paper_ic_penalty_variant,
+        ridge_alpha=config.predictive_tv_ife_ridge_alpha,
+        bandwidth_scale=config.predictive_tv_ife_bandwidth_scale,
+        min_window=config.paper_min_window,
+    ).fit(train_frame)
+    model.model_name = "tv_ife_predictive_augmented"
+    return model
 
 
 def run_backtest(
@@ -150,6 +172,15 @@ def run_backtest(
         paper_fold_result["selected_factor_count"] = paper_model.selected_factor_count_
         evaluation_rows.append(paper_fold_result)
 
+        predictive_tv_model = _fit_predictive_tv_ife_model(direct_train, config)
+        predictive_fold_result = _append_fold_result(
+            predictive_tv_model.model_name,
+            direct_test,
+            predictive_tv_model.predict(direct_test),
+        )
+        predictive_fold_result["selected_factor_count"] = predictive_tv_model.selected_factor_count_
+        evaluation_rows.append(predictive_fold_result)
+
     evaluation = pd.concat(evaluation_rows, ignore_index=True)
     summary = summarize_evaluation(evaluation)
     paper_selection = pd.DataFrame(paper_selection_rows)
@@ -167,13 +198,21 @@ def fit_final_models_and_forecast(
     paper_forecast_frame: pd.DataFrame,
     next_target_month: str,
     config: PipelineConfig,
-) -> tuple[pd.DataFrame, PaperInspiredFactorForecaster]:
+    paper_n_factors: int | None = None,
+    paper_feature_columns: tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, PaperInspiredFactorForecaster, PaperInspiredFactorForecaster]:
     """Fit final models on all available data and forecast the next target month."""
 
     naive_model = NaiveLastMonthModel().fit(direct_training_frame)
     direct_model = DirectRidgeForecaster(alpha=config.direct_model_alpha).fit(direct_training_frame)
 
-    paper_model, _ = _fit_paper_model(paper_training_frame, config)
+    paper_model, _ = _fit_paper_model(
+        paper_training_frame,
+        config,
+        n_factors=paper_n_factors,
+        feature_columns=paper_feature_columns,
+    )
+    predictive_tv_model = _fit_predictive_tv_ife_model(direct_training_frame, config)
 
     forecast_rows = []
     for model_name, forecast_frame, prediction in [
@@ -192,6 +231,11 @@ def fit_final_models_and_forecast(
             paper_forecast_frame,
             paper_model.predict(paper_forecast_frame),
         ),
+        (
+            predictive_tv_model.model_name,
+            direct_forecast_frame,
+            predictive_tv_model.predict(direct_forecast_frame),
+        ),
     ]:
         output = forecast_frame[["family_id", "brand"]].copy()
         output["target_month"] = next_target_month
@@ -203,7 +247,13 @@ def fit_final_models_and_forecast(
         output["y_pred"] = pd.Series(predicted_values, index=forecast_frame.index).astype(float).clip(lower=0)
         if model_name == paper_model.model_name:
             output["selected_factor_count"] = paper_model.selected_factor_count_
+        if model_name == predictive_tv_model.model_name:
+            output["selected_factor_count"] = predictive_tv_model.selected_factor_count_
         forecast_rows.append(output)
 
     final_forecast = pd.concat(forecast_rows, ignore_index=True)
-    return final_forecast.sort_values(["model_name", "family_id"]).reset_index(drop=True), paper_model
+    return (
+        final_forecast.sort_values(["model_name", "family_id"]).reset_index(drop=True),
+        paper_model,
+        predictive_tv_model,
+    )

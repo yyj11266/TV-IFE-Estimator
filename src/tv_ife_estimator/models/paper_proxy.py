@@ -127,10 +127,12 @@ class PaperInspiredFactorForecaster:
     def __init__(
         self,
         n_factors: int | None = None,
+        feature_columns: tuple[str, ...] | None = None,
         factor_candidates: tuple[int, ...] = (),
         max_factor_count: int = 6,
         ic_penalty_variant: str = "rho2",
         ridge_alpha: float = 1e-6,
+        bandwidth_scale: float = 0.5,
         min_window: float = 2.0,
         max_iter: int = 50,
         tolerance: float = 1e-6,
@@ -140,11 +142,12 @@ class PaperInspiredFactorForecaster:
         self.max_factor_count = max_factor_count
         self.ic_penalty_variant = ic_penalty_variant
         self.ridge_alpha = ridge_alpha
+        self.bandwidth_scale = bandwidth_scale
         self.min_window = min_window
         self.max_iter = max_iter
         self.tolerance = tolerance
 
-        self.feature_columns = list(CORE_PAPER_NUMERIC_FEATURES)
+        self.feature_columns = list(feature_columns or CORE_PAPER_NUMERIC_FEATURES)
 
         self.panel_: _TVIFEPanel | None = None
         self.state_: _TVIFEFitState | None = None
@@ -190,7 +193,10 @@ class PaperInspiredFactorForecaster:
         sigma_hat = float(np.std(y)) if y.size else 0.0
         bandwidth = max(
             self.min_window / max(len(source_month_index), 1),
-            (2.35 / math.sqrt(12.0)) * max(sigma_hat, 1.0) * (max(len(source_month_index) * len(family_ids), 1) ** (-2.0 / 9.0)),
+            self.bandwidth_scale
+            * (2.35 / math.sqrt(12.0))
+            * max(sigma_hat, 1e-8)
+            * (max(len(source_month_index) * len(family_ids), 1) ** (-2.0 / 9.0)),
         )
 
         positions = np.arange(len(source_month_index), dtype=float)

@@ -24,6 +24,7 @@ from .preprocessing import (
     build_family_month_panel,
     build_family_static_profile,
 )
+from .research import PaperEmpiricalStudyArtifacts, run_paper_empirical_study
 
 
 @dataclass
@@ -37,6 +38,7 @@ class PipelineArtifacts:
     family_month_panel: pd.DataFrame
     direct_training_frame: pd.DataFrame
     paper_training_frame: pd.DataFrame
+    paper_empirical_study: PaperEmpiricalStudyArtifacts
     backtest: BacktestArtifacts
     next_month_forecast: pd.DataFrame
 
@@ -64,6 +66,7 @@ def _write_outputs(
     paths: ProjectPaths,
     artifacts: PipelineArtifacts,
     final_paper_model,
+    final_predictive_tv_model,
 ) -> None:
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +78,30 @@ def _write_outputs(
     _save_csv(artifacts.backtest.evaluation, paths.output_dir / "forecast_eval.csv")
     _save_csv(artifacts.backtest.summary, paths.output_dir / "model_summary.csv")
     _save_csv(artifacts.backtest.paper_selection, paths.output_dir / "paper_factor_selection.csv")
+    _save_csv(
+        artifacts.paper_empirical_study.feature_diagnostics,
+        paths.output_dir / "paper_empirical_feature_diagnostics.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.sensitivity_summary,
+        paths.output_dir / "paper_empirical_sensitivity_summary.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.sensitivity_fold_results,
+        paths.output_dir / "paper_empirical_sensitivity_folds.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.recommendation,
+        paths.output_dir / "paper_empirical_recommendation.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.predictive_summary,
+        paths.output_dir / "paper_predictive_augmented_summary.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.predictive_recommendation,
+        paths.output_dir / "paper_predictive_augmented_recommendation.csv",
+    )
     _save_csv(artifacts.next_month_forecast, paths.output_dir / "next_month_forecast.csv")
 
     paper_artifacts = final_paper_model.export_artifacts()
@@ -84,6 +111,14 @@ def _write_outputs(
     _save_csv(paper_artifacts.selection, paths.output_dir / "paper_track_ic.csv")
     _save_csv(paper_artifacts.fitted, paths.output_dir / "paper_track_fitted.csv")
     _save_csv(paper_artifacts.fit_summary, paths.output_dir / "paper_track_fit_summary.csv")
+
+    predictive_artifacts = final_predictive_tv_model.export_artifacts()
+    _save_csv(predictive_artifacts.coefficients, paths.output_dir / "predictive_tv_ife_coefficients.csv")
+    _save_csv(predictive_artifacts.factors, paths.output_dir / "predictive_tv_ife_factors.csv")
+    _save_csv(predictive_artifacts.loadings, paths.output_dir / "predictive_tv_ife_loadings.csv")
+    _save_csv(predictive_artifacts.selection, paths.output_dir / "predictive_tv_ife_ic.csv")
+    _save_csv(predictive_artifacts.fitted, paths.output_dir / "predictive_tv_ife_fitted.csv")
+    _save_csv(predictive_artifacts.fit_summary, paths.output_dir / "predictive_tv_ife_fit_summary.csv")
 
     diagnostics_payload = {
         "subset_validation": {
@@ -119,18 +154,33 @@ def run_pipeline(
 
     direct_training_frame = build_direct_training_frame(family_month_panel, family_static_profile)
     paper_training_frame = build_paper_training_frame(family_month_panel, family_static_profile)
+    paper_empirical_study = run_paper_empirical_study(paper_training_frame, config)
     backtest = run_backtest(direct_training_frame, paper_training_frame, config)
+    recommendation_row = paper_empirical_study.recommendation.iloc[0]
+    recommended_feature_columns = tuple(
+        column.strip()
+        for column in str(recommendation_row["recommended_feature_columns"]).split(",")
+        if column.strip()
+    )
+    recommended_factor_mode = str(recommendation_row["recommended_factor_mode"])
+    recommended_n_factors = (
+        int(recommended_factor_mode.removeprefix("fixed_"))
+        if recommended_factor_mode.startswith("fixed_")
+        else None
+    )
 
     next_target_month = "202407"
     direct_forecast_frame = build_direct_forecast_frame(family_month_panel, family_static_profile, source_month="202406")
     paper_forecast_frame = build_paper_forecast_frame(family_month_panel, family_static_profile, source_month="202406")
-    next_month_forecast, final_paper_model = fit_final_models_and_forecast(
+    next_month_forecast, final_paper_model, final_predictive_tv_model = fit_final_models_and_forecast(
         direct_training_frame=direct_training_frame,
         paper_training_frame=paper_training_frame,
         direct_forecast_frame=direct_forecast_frame,
         paper_forecast_frame=paper_forecast_frame,
         next_target_month=next_target_month,
         config=config,
+        paper_n_factors=recommended_n_factors,
+        paper_feature_columns=recommended_feature_columns,
     )
 
     artifacts = PipelineArtifacts(
@@ -141,8 +191,9 @@ def run_pipeline(
         family_month_panel=family_month_panel,
         direct_training_frame=direct_training_frame,
         paper_training_frame=paper_training_frame,
+        paper_empirical_study=paper_empirical_study,
         backtest=backtest,
         next_month_forecast=next_month_forecast,
     )
-    _write_outputs(paths, artifacts, final_paper_model)
+    _write_outputs(paths, artifacts, final_paper_model, final_predictive_tv_model)
     return artifacts
