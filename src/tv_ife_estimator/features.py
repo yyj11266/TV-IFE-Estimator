@@ -72,7 +72,7 @@ def build_direct_forecast_frame(
     )
     frame["prev_discount"] = frame["prev_asp"] / frame["ref_price"]
     frame["log_prev_sales"] = np.log1p(frame["sales"])
-    frame["log_prev_prev_sales"] = np.log1p(frame["prev_sales"])
+    frame["log_prev_prev_sales"] = np.log1p(frame["prev_prev_sales"])
     frame["log_prev_two_month_mean"] = np.log1p(frame["prev_two_month_mean"])
     frame["source_month"] = frame["month"]
     frame["source_month_index"] = frame["month_index"]
