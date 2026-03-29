@@ -81,6 +81,9 @@ def _write_outputs(
     _save_csv(paper_artifacts.coefficients, paths.output_dir / "paper_track_coefficients.csv")
     _save_csv(paper_artifacts.factors, paths.output_dir / "paper_track_factors.csv")
     _save_csv(paper_artifacts.loadings, paths.output_dir / "paper_track_loadings.csv")
+    _save_csv(paper_artifacts.selection, paths.output_dir / "paper_track_ic.csv")
+    _save_csv(paper_artifacts.fitted, paths.output_dir / "paper_track_fitted.csv")
+    _save_csv(paper_artifacts.fit_summary, paths.output_dir / "paper_track_fit_summary.csv")
 
     diagnostics_payload = {
         "subset_validation": {

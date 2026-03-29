@@ -63,4 +63,7 @@ tv-ife-estimator
 - `outputs/paper_track_coefficients.csv`
 - `outputs/paper_track_factors.csv`
 - `outputs/paper_track_loadings.csv`
+- `outputs/paper_track_ic.csv`
+- `outputs/paper_track_fitted.csv`
+- `outputs/paper_track_fit_summary.csv`
 - `outputs/diagnostics.json`

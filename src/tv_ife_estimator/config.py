@@ -38,11 +38,12 @@ class PipelineConfig:
 
     full_months: tuple[str, ...] = FULL_MONTHS
     target_months: tuple[str, ...] = DEFAULT_TARGET_MONTHS
-    factor_candidates: tuple[int, ...] = (1, 2)
+    factor_candidates: tuple[int, ...] = ()
+    paper_max_factor_count: int = 6
+    paper_ic_penalty_variant: str = "rho2"
     direct_model_alpha: float = 1.0
-    paper_model_alpha: float = 1.0
+    paper_model_alpha: float = 1e-6
     paper_min_window: float = 2.0
-    internal_validation_min_months: int = 4
 
 
 def default_paths(root: str | Path | None = None) -> ProjectPaths:

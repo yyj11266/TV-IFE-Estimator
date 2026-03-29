@@ -40,7 +40,11 @@ def _append_fold_result(
     frame: pd.DataFrame,
     prediction: pd.Series | np.ndarray,
 ) -> pd.DataFrame:
-    predicted = pd.Series(prediction, index=frame.index, dtype=float).clip(lower=0)
+    if isinstance(prediction, pd.Series):
+        predicted_values = prediction.reindex(frame.index).to_numpy(dtype=float)
+    else:
+        predicted_values = np.asarray(prediction, dtype=float)
+    predicted = pd.Series(predicted_values, index=frame.index, dtype=float).clip(lower=0)
     result = frame[["family_id", "brand", "target_month", "target_sales"]].copy()
     result["model_name"] = model_name
     result["y_true"] = result["target_sales"].astype(float)
@@ -88,43 +92,23 @@ def summarize_evaluation(evaluation: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summary_rows).sort_values(["smape", "mae", "model_name"]).reset_index(drop=True)
 
 
-def _select_paper_factor_count(
+def _fit_paper_model(
     train_frame: pd.DataFrame,
     config: PipelineConfig,
-) -> tuple[int, list[dict[str, float | int | str]]]:
-    month_order = sorted(train_frame["target_month"].dropna().unique())
-    if len(month_order) < config.internal_validation_min_months:
-        return config.factor_candidates[0], []
-
-    validation_month = month_order[-1]
-    internal_train = train_frame[train_frame["target_month"] < validation_month].copy()
-    internal_validation = train_frame[train_frame["target_month"] == validation_month].copy()
-    if internal_train.empty or internal_validation.empty:
-        return config.factor_candidates[0], []
-
-    records: list[dict[str, float | int | str]] = []
-    best_factor = config.factor_candidates[0]
-    best_score = float("inf")
-    for factor_count in config.factor_candidates:
-        model = PaperInspiredFactorForecaster(
-            n_factors=factor_count,
-            ridge_alpha=config.paper_model_alpha,
-            min_window=config.paper_min_window,
-        )
-        model.fit(internal_train)
-        prediction = model.predict(internal_validation)
-        score = smape(internal_validation["target_sales"], prediction)
-        records.append(
-            {
-                "validation_month": validation_month,
-                "factor_count": factor_count,
-                "validation_smape": score,
-            }
-        )
-        if score < best_score or (np.isclose(score, best_score) and factor_count < best_factor):
-            best_factor = factor_count
-            best_score = score
-    return best_factor, records
+) -> tuple[PaperInspiredFactorForecaster, list[dict[str, float | int | str]]]:
+    model = PaperInspiredFactorForecaster(
+        n_factors=None,
+        factor_candidates=config.factor_candidates,
+        max_factor_count=config.paper_max_factor_count,
+        ic_penalty_variant=config.paper_ic_penalty_variant,
+        ridge_alpha=config.paper_model_alpha,
+        min_window=config.paper_min_window,
+    ).fit(train_frame)
+    records = model.selection_table_.to_dict(orient="records") if model.selection_table_ is not None else []
+    for record in records:
+        record["selected_factor_count"] = model.selected_factor_count_
+        record["selected"] = int(record["factor_count"] == model.selected_factor_count_)
+    return model, records
 
 
 def run_backtest(
@@ -157,18 +141,13 @@ def run_backtest(
         direct_model = DirectRidgeForecaster(alpha=config.direct_model_alpha).fit(direct_train)
         evaluation_rows.append(_append_fold_result(direct_model.model_name, direct_test, direct_model.predict(direct_test)))
 
-        selected_factor_count, selection_records = _select_paper_factor_count(paper_train, config)
+        paper_model, selection_records = _fit_paper_model(paper_train, config)
         for record in selection_records:
             record["forecast_target_month"] = target_month
         paper_selection_rows.extend(selection_records)
 
-        paper_model = PaperInspiredFactorForecaster(
-            n_factors=selected_factor_count,
-            ridge_alpha=config.paper_model_alpha,
-            min_window=config.paper_min_window,
-        ).fit(paper_train)
         paper_fold_result = _append_fold_result(paper_model.model_name, paper_test, paper_model.predict(paper_test))
-        paper_fold_result["selected_factor_count"] = selected_factor_count
+        paper_fold_result["selected_factor_count"] = paper_model.selected_factor_count_
         evaluation_rows.append(paper_fold_result)
 
     evaluation = pd.concat(evaluation_rows, ignore_index=True)
@@ -194,12 +173,7 @@ def fit_final_models_and_forecast(
     naive_model = NaiveLastMonthModel().fit(direct_training_frame)
     direct_model = DirectRidgeForecaster(alpha=config.direct_model_alpha).fit(direct_training_frame)
 
-    selected_factor_count, _ = _select_paper_factor_count(paper_training_frame, config)
-    paper_model = PaperInspiredFactorForecaster(
-        n_factors=selected_factor_count,
-        ridge_alpha=config.paper_model_alpha,
-        min_window=config.paper_min_window,
-    ).fit(paper_training_frame)
+    paper_model, _ = _fit_paper_model(paper_training_frame, config)
 
     forecast_rows = []
     for model_name, forecast_frame, prediction in [
@@ -222,9 +196,13 @@ def fit_final_models_and_forecast(
         output = forecast_frame[["family_id", "brand"]].copy()
         output["target_month"] = next_target_month
         output["model_name"] = model_name
-        output["y_pred"] = pd.Series(prediction, index=forecast_frame.index).astype(float).clip(lower=0)
+        if isinstance(prediction, pd.Series):
+            predicted_values = prediction.reindex(forecast_frame.index).to_numpy(dtype=float)
+        else:
+            predicted_values = np.asarray(prediction, dtype=float)
+        output["y_pred"] = pd.Series(predicted_values, index=forecast_frame.index).astype(float).clip(lower=0)
         if model_name == paper_model.model_name:
-            output["selected_factor_count"] = selected_factor_count
+            output["selected_factor_count"] = paper_model.selected_factor_count_
         forecast_rows.append(output)
 
     final_forecast = pd.concat(forecast_rows, ignore_index=True)
