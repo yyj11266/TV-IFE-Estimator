@@ -50,6 +50,12 @@ or
 tv-ife-estimator
 ```
 
+For ad hoc reporting visuals built from `outputs/*.csv`:
+
+```bash
+python -m tv_ife_estimator.report_viz
+```
+
 ## Main Outputs
 
 - `outputs/family_lookup.csv`

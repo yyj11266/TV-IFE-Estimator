@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Structured pipeline for router family sales forecasting with direct and paper-inspired models."
 requires-python = ">=3.11"
 dependencies = [
+  "matplotlib>=3.8",
   "numpy>=1.26",
   "openpyxl>=3.1",
   "pandas>=2.2",
@@ -16,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 tv-ife-estimator = "tv_ife_estimator.cli:main"
+tv-ife-report-viz = "tv_ife_estimator.report_viz:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
