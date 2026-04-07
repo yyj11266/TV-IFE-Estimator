@@ -11,18 +11,18 @@ from .backtest import smape
 from .config import PipelineConfig
 from .constants import CORE_PAPER_NUMERIC_FEATURES
 from .models.paper_proxy import PaperInspiredFactorForecaster
+from .models.predictive_tv import LaunchAwarePredictiveTVForecaster
 
 _EMPIRICAL_FEATURE_SPECS: dict[str, tuple[str, ...]] = {
     "baseline_price_level": CORE_PAPER_NUMERIC_FEATURES,
-    "deleveled_price_gap": ("current_price_gap",),
+    "deleveled_price_gap": ("aligned_price_gap",),
     "discount_mesh_interaction": ("current_discount", "current_discount_x_mesh"),
 }
-_EMPIRICAL_FACTOR_MODES: tuple[str, ...] = ("auto_ic", "fixed_0", "fixed_1", "fixed_2")
 _PREDICTIVE_AUGMENTED_SPECS: dict[str, tuple[str, ...]] = {
     "paper_baseline": CORE_PAPER_NUMERIC_FEATURES,
     "lag_sales_only": ("log_sales",),
     "lag_sales_discount": ("log_sales", "current_discount"),
-    "lag_sales_price_gap": ("log_sales", "current_price_gap"),
+    "lag_sales_price_gap": ("log_sales", "aligned_price_gap"),
     "lag_sales_full_price": ("log_sales", "current_log_asp", "current_discount"),
 }
 
@@ -35,14 +35,34 @@ class PaperEmpiricalStudyArtifacts:
     sensitivity_summary: pd.DataFrame
     sensitivity_fold_results: pd.DataFrame
     recommendation: pd.DataFrame
+    predictive_tv_sensitivity_summary: pd.DataFrame
+    predictive_tv_sensitivity_fold_results: pd.DataFrame
+    predictive_tv_recommendation: pd.DataFrame
     predictive_summary: pd.DataFrame
     predictive_recommendation: pd.DataFrame
 
 
 def _factor_mode_to_value(factor_mode: str) -> int | None:
-    if factor_mode == "auto_ic":
+    if factor_mode == "auto_bic":
         return None
     return int(factor_mode.removeprefix("fixed_"))
+
+
+def _empirical_factor_modes(config: PipelineConfig) -> tuple[str, ...]:
+    return ("auto_bic", *(f"fixed_{count}" for count in range(config.paper_max_factor_count + 1)))
+
+
+def _paper_empirical_feature_specs(config: PipelineConfig) -> list[tuple[str, tuple[str, ...]]]:
+    ordered_specs = [("configured_paper_model", tuple(config.paper_feature_columns)), *_EMPIRICAL_FEATURE_SPECS.items()]
+    normalized: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[tuple[str, ...]] = set()
+    for spec_name, feature_columns in ordered_specs:
+        normalized_columns = tuple(feature_columns)
+        if not normalized_columns or normalized_columns in seen:
+            continue
+        seen.add(normalized_columns)
+        normalized.append((spec_name, normalized_columns))
+    return normalized
 
 
 def _series_effective_rank(values: np.ndarray) -> tuple[float, float]:
@@ -119,11 +139,12 @@ def _feature_diagnostics(frame: pd.DataFrame, spec_name: str, feature_columns: t
 def _run_paper_sensitivity(
     paper_training_frame: pd.DataFrame,
     config: PipelineConfig,
+    feature_specs: list[tuple[str, tuple[str, ...]]],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     fold_rows: list[dict[str, float | int | str]] = []
 
-    for spec_name, feature_columns in _EMPIRICAL_FEATURE_SPECS.items():
-        for factor_mode in _EMPIRICAL_FACTOR_MODES:
+    for spec_name, feature_columns in feature_specs:
+        for factor_mode in _empirical_factor_modes(config):
             forced_factor_count = _factor_mode_to_value(factor_mode)
             for target_month in config.target_months:
                 train = paper_training_frame[paper_training_frame["target_month"].astype(str) < target_month].copy()
@@ -136,6 +157,9 @@ def _run_paper_sensitivity(
                     max_factor_count=config.paper_max_factor_count,
                     ic_penalty_variant=config.paper_ic_penalty_variant,
                     ridge_alpha=config.paper_model_alpha,
+                    bandwidth_scale=config.paper_bandwidth_scale,
+                    bandwidth_method=config.paper_bandwidth_method,
+                    bandwidth_pilot_scale=config.paper_bandwidth_pilot_scale,
                     min_window=config.paper_min_window,
                 ).fit(train)
 
@@ -192,25 +216,25 @@ def _run_paper_sensitivity(
 def _build_recommendation(sensitivity_summary: pd.DataFrame) -> pd.DataFrame:
     recommendation = sensitivity_summary.sort_values(["smape", "rmse", "mae"]).iloc[0].copy()
     reason = "Lowest average backtest SMAPE across the empirical study."
-
-    stable_auto_zero = sensitivity_summary[
-        (sensitivity_summary["factor_mode"] == "auto_ic")
-        & (sensitivity_summary["selected_factor_path"].str.fullmatch(r"0(,0)*"))
-    ]
-    if not stable_auto_zero.empty:
-        stable_auto_zero = stable_auto_zero.sort_values(["smape", "rmse", "mae"]).iloc[0]
-        fixed_zero = sensitivity_summary[
-            (sensitivity_summary["spec_name"] == stable_auto_zero["spec_name"])
-            & (sensitivity_summary["factor_mode"] == "fixed_0")
-        ]
-        if not fixed_zero.empty:
-            fixed_zero = fixed_zero.iloc[0]
-            if abs(float(fixed_zero["smape"]) - float(stable_auto_zero["smape"])) <= 1e-12:
-                recommendation = fixed_zero.copy()
-                reason = (
-                    "Auto IC selected 0 factors in every backtest fold for this feature set, "
-                    "so the deployment recommendation is fixed_0 to avoid small-sample factor instability."
-                )
+    metric_tolerance = 1e-10
+    stable_auto_candidates = sensitivity_summary[
+        (sensitivity_summary["factor_mode"] == "auto_bic")
+        & (sensitivity_summary["selection_consistent"] == 1)
+    ].sort_values(["smape", "rmse", "mae", "spec_name"])
+    for _, stable_auto in stable_auto_candidates.iterrows():
+        auto_is_effectively_best = (
+            abs(float(stable_auto["smape"]) - float(recommendation["smape"])) <= metric_tolerance
+            and abs(float(stable_auto["rmse"]) - float(recommendation["rmse"])) <= metric_tolerance
+            and abs(float(stable_auto["mae"]) - float(recommendation["mae"])) <= metric_tolerance
+        )
+        if auto_is_effectively_best:
+            recommendation = stable_auto.copy()
+            selected_factor_count = int(round(float(stable_auto["mean_selected_factor_count"])))
+            reason = (
+                f"Auto BIC selected {selected_factor_count} factors in every backtest fold for this feature set, "
+                "so the recommendation keeps the original automatic factor-selection rule."
+            )
+            break
 
     return pd.DataFrame(
         [
@@ -223,6 +247,133 @@ def _build_recommendation(sensitivity_summary: pd.DataFrame) -> pd.DataFrame:
                 "backtest_smape": float(recommendation["smape"]),
                 "selected_factor_path": str(recommendation["selected_factor_path"]),
                 "recommendation_reason": reason,
+            }
+        ]
+    )
+
+
+def _fit_predictive_tv_model(
+    direct_training_frame: pd.DataFrame,
+    config: PipelineConfig,
+    n_factors: int | None,
+) -> LaunchAwarePredictiveTVForecaster:
+    return LaunchAwarePredictiveTVForecaster(
+        launch_feature_columns=config.predictive_tv_ife_feature_columns,
+        mature_feature_columns=config.predictive_tv_ife_mature_feature_columns,
+        mature_feature_candidates=config.predictive_tv_ife_mature_feature_candidates,
+        factor_candidates=config.factor_candidates,
+        max_factor_count=config.paper_max_factor_count,
+        ic_penalty_variant=config.paper_ic_penalty_variant,
+        ridge_alpha=config.predictive_tv_ife_ridge_alpha,
+        bandwidth_scale=config.predictive_tv_ife_bandwidth_scale,
+        bandwidth_method=config.predictive_tv_ife_bandwidth_method,
+        bandwidth_pilot_scale=config.predictive_tv_ife_bandwidth_pilot_scale,
+        min_window=config.paper_min_window,
+        n_factors=n_factors,
+        mature_history_threshold=config.predictive_tv_ife_mature_history_threshold,
+        mature_history_threshold_candidates=config.predictive_tv_ife_mature_history_threshold_candidates,
+        mature_blend_weight=config.predictive_tv_ife_mature_blend_weight,
+        mature_blend_weight_candidates=config.predictive_tv_ife_mature_blend_weight_candidates,
+        enable_inner_validation=config.predictive_tv_ife_enable_inner_validation,
+        inner_validation_min_months=config.predictive_tv_ife_inner_validation_min_months,
+    ).fit(direct_training_frame)
+
+
+def _run_predictive_tv_sensitivity(
+    direct_training_frame: pd.DataFrame,
+    config: PipelineConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fold_rows: list[dict[str, float | int | str]] = []
+
+    for factor_mode in _empirical_factor_modes(config):
+        forced_factor_count = _factor_mode_to_value(factor_mode)
+        for target_month in config.target_months:
+            train = direct_training_frame[direct_training_frame["target_month"].astype(str) < target_month].copy()
+            test = direct_training_frame[direct_training_frame["target_month"].astype(str) == target_month].copy()
+
+            model = _fit_predictive_tv_model(train, config, forced_factor_count)
+            prediction = model.predict(test).to_numpy(dtype=float)
+            actual = test["target_sales"].to_numpy(dtype=float)
+            denominator = np.abs(actual) + np.abs(prediction)
+            valid = denominator > 0
+            fold_rows.append(
+                {
+                    "factor_mode": factor_mode,
+                    "target_month": target_month,
+                    "selected_factor_count": int(model.selected_factor_count_ or 0),
+                    "selected_launch_factor_count": int(model.selected_launch_factor_count_ or 0),
+                    "selected_mature_factor_count": int(model.selected_mature_factor_count_ or 0),
+                    "selected_mature_feature_columns": ",".join(model.selected_mature_feature_columns_),
+                    "selected_mature_history_threshold": int(model.selected_mature_history_threshold_),
+                    "selected_mature_blend_weight": float(model.selected_mature_blend_weight_),
+                    "parameter_source": str(model.parameter_source_),
+                    "mae": float(np.mean(np.abs(actual - prediction))),
+                    "rmse": float(np.sqrt(np.mean((actual - prediction) ** 2))),
+                    "smape": float(
+                        np.mean(2.0 * np.abs(actual[valid] - prediction[valid]) / denominator[valid]) if valid.any() else 0.0
+                    ),
+                    "n_predictions": int(len(test)),
+                }
+            )
+
+    fold_results = pd.DataFrame(fold_rows).sort_values(["factor_mode", "target_month"]).reset_index(drop=True)
+
+    summary_rows: list[dict[str, float | int | str]] = []
+    for factor_mode, group in fold_results.groupby("factor_mode", sort=True):
+        summary_rows.append(
+            {
+                "factor_mode": factor_mode,
+                "mae": float(group["mae"].mean()),
+                "rmse": float(np.sqrt(np.mean(group["rmse"].astype(float) ** 2))),
+                "smape": float(group["smape"].mean()),
+                "selected_launch_factor_path": ",".join(group["selected_launch_factor_count"].astype(int).astype(str)),
+                "selected_mature_factor_path": ",".join(group["selected_mature_factor_count"].astype(int).astype(str)),
+                "factor_selection_consistent": int(
+                    group["selected_launch_factor_count"].nunique() == 1
+                    and group["selected_mature_factor_count"].nunique() == 1
+                ),
+                "mean_selected_launch_factor_count": float(group["selected_launch_factor_count"].mean()),
+                "mean_selected_mature_factor_count": float(group["selected_mature_factor_count"].mean()),
+                "selected_mature_feature_path": "|".join(group["selected_mature_feature_columns"].astype(str)),
+                "mature_feature_consistent": int(group["selected_mature_feature_columns"].nunique() == 1),
+                "selected_mature_history_threshold_path": ",".join(
+                    group["selected_mature_history_threshold"].astype(int).astype(str)
+                ),
+                "mature_history_threshold_consistent": int(group["selected_mature_history_threshold"].nunique() == 1),
+                "selected_mature_blend_weight_path": ",".join(
+                    group["selected_mature_blend_weight"].map(lambda value: f"{float(value):g}")
+                ),
+                "mature_blend_weight_consistent": int(group["selected_mature_blend_weight"].nunique() == 1),
+                "parameter_source_path": ",".join(group["parameter_source"].astype(str)),
+                "parameter_source_consistent": int(group["parameter_source"].nunique() == 1),
+                "n_target_months": int(group["target_month"].nunique()),
+            }
+        )
+
+    summary = (
+        pd.DataFrame(summary_rows)
+        .sort_values(["smape", "rmse", "mae", "factor_mode"])
+        .reset_index(drop=True)
+    )
+    return fold_results, summary
+
+
+def _build_predictive_tv_recommendation(predictive_tv_sensitivity_summary: pd.DataFrame) -> pd.DataFrame:
+    recommendation = predictive_tv_sensitivity_summary.sort_values(["smape", "rmse", "mae"]).iloc[0]
+    return pd.DataFrame(
+        [
+            {
+                "recommended_factor_mode": str(recommendation["factor_mode"]),
+                "backtest_mae": float(recommendation["mae"]),
+                "backtest_rmse": float(recommendation["rmse"]),
+                "backtest_smape": float(recommendation["smape"]),
+                "selected_launch_factor_path": str(recommendation["selected_launch_factor_path"]),
+                "selected_mature_factor_path": str(recommendation["selected_mature_factor_path"]),
+                "selected_mature_feature_path": str(recommendation["selected_mature_feature_path"]),
+                "selected_mature_history_threshold_path": str(recommendation["selected_mature_history_threshold_path"]),
+                "selected_mature_blend_weight_path": str(recommendation["selected_mature_blend_weight_path"]),
+                "parameter_source_path": str(recommendation["parameter_source_path"]),
+                "recommendation_reason": "Lowest average backtest SMAPE across the predictive TV fixed-factor study.",
             }
         ]
     )
@@ -246,6 +397,9 @@ def _run_predictive_augmentation_study(
                 max_factor_count=config.paper_max_factor_count,
                 ic_penalty_variant=config.paper_ic_penalty_variant,
                 ridge_alpha=config.paper_model_alpha,
+                bandwidth_scale=config.paper_bandwidth_scale,
+                bandwidth_method=config.paper_bandwidth_method,
+                bandwidth_pilot_scale=config.paper_bandwidth_pilot_scale,
                 min_window=config.paper_min_window,
             ).fit(train)
             actual_values.extend(test["target_sales"].astype(float).tolist())
@@ -283,23 +437,33 @@ def _run_predictive_augmentation_study(
 
 
 def run_paper_empirical_study(
+    direct_training_frame: pd.DataFrame,
     paper_training_frame: pd.DataFrame,
     config: PipelineConfig,
 ) -> PaperEmpiricalStudyArtifacts:
-    """Run paper-track diagnostics and a small-sample sensitivity study."""
+    """Run paper-track diagnostics plus fixed-factor sensitivity studies."""
 
+    feature_specs = _paper_empirical_feature_specs(config)
     diagnostics_rows: list[dict[str, float | int | str]] = []
-    for spec_name, feature_columns in _EMPIRICAL_FEATURE_SPECS.items():
+    for spec_name, feature_columns in feature_specs:
         diagnostics_rows.extend(_feature_diagnostics(paper_training_frame, spec_name, feature_columns))
 
-    fold_results, sensitivity_summary = _run_paper_sensitivity(paper_training_frame, config)
+    fold_results, sensitivity_summary = _run_paper_sensitivity(paper_training_frame, config, feature_specs)
     recommendation = _build_recommendation(sensitivity_summary)
+    predictive_tv_fold_results, predictive_tv_sensitivity_summary = _run_predictive_tv_sensitivity(
+        direct_training_frame,
+        config,
+    )
+    predictive_tv_recommendation = _build_predictive_tv_recommendation(predictive_tv_sensitivity_summary)
     predictive_summary, predictive_recommendation = _run_predictive_augmentation_study(paper_training_frame, config)
     return PaperEmpiricalStudyArtifacts(
         feature_diagnostics=pd.DataFrame(diagnostics_rows).sort_values(["spec_name", "feature_name"]).reset_index(drop=True),
         sensitivity_summary=sensitivity_summary,
         sensitivity_fold_results=fold_results,
         recommendation=recommendation,
+        predictive_tv_sensitivity_summary=predictive_tv_sensitivity_summary,
+        predictive_tv_sensitivity_fold_results=predictive_tv_fold_results,
+        predictive_tv_recommendation=predictive_tv_recommendation,
         predictive_summary=predictive_summary,
         predictive_recommendation=predictive_recommendation,
     )

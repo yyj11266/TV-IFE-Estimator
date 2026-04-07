@@ -22,22 +22,30 @@ import pandas as pd
 
 from .config import default_paths
 
-MODEL_ORDER = ["naive_last_month", "direct_ridge", "paper_inspired_factor"]
+BASE_MODEL_ORDER = [
+    "naive_last_month",
+    "direct_ridge",
+    "paper_inspired_factor",
+    "tv_ife_predictive_augmented",
+]
 MODEL_LABELS = {
     "naive_last_month": "Naive",
     "direct_ridge": "Direct Ridge",
     "paper_inspired_factor": "Paper TV-IFE",
+    "tv_ife_predictive_augmented": "Launch-Aware TV-IFE",
 }
 MODEL_COLORS = {
     "naive_last_month": "#3b3b3b",
     "direct_ridge": "#197278",
     "paper_inspired_factor": "#c44536",
+    "tv_ife_predictive_augmented": "#4b68b8",
 }
 METRIC_LABELS = {
     "mae": "MAE",
     "rmse": "RMSE",
     "smape": "sMAPE",
 }
+FALLBACK_MODEL_COLORS = ["#6f7d8c", "#2a6f97", "#ff7f51", "#6a994e", "#a44a3f", "#7b6d8d"]
 
 
 @dataclass
@@ -113,6 +121,36 @@ def _save_figure(fig: plt.Figure, path: Path) -> None:
     plt.close(fig)
 
 
+def _resolve_model_order(model_names: pd.Series | list[str] | tuple[str, ...]) -> list[str]:
+    unique_names = [str(name) for name in dict.fromkeys(model_names) if pd.notna(name)]
+    preferred = [name for name in BASE_MODEL_ORDER if name in unique_names]
+    remaining = sorted(name for name in unique_names if name not in preferred)
+    return preferred + remaining
+
+
+def _resolve_model_colors(model_names: pd.Series | list[str] | tuple[str, ...]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    fallback_index = 0
+    for model_name in _resolve_model_order(model_names):
+        if model_name in MODEL_COLORS:
+            resolved[model_name] = MODEL_COLORS[model_name]
+            continue
+        resolved[model_name] = FALLBACK_MODEL_COLORS[fallback_index % len(FALLBACK_MODEL_COLORS)]
+        fallback_index += 1
+    return resolved
+
+
+def _label_for_model(model_name: str) -> str:
+    return MODEL_LABELS.get(model_name, model_name.replace("_", " ").title())
+
+
+def _format_month_label(target_month: str) -> str:
+    month_text = str(target_month)
+    if len(month_text) == 6 and month_text.isdigit():
+        return f"{month_text[:4]}-{month_text[4:6]}"
+    return month_text
+
+
 def _monthly_metrics(evaluation: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
     for (model_name, target_month), frame in evaluation.groupby(["model_name", "target_month"], sort=True):
@@ -120,6 +158,9 @@ def _monthly_metrics(evaluation: pd.DataFrame) -> pd.DataFrame:
         y_pred = frame["y_pred"].astype(float).to_numpy()
         denominator = np.abs(y_true) + np.abs(y_pred)
         valid = denominator > 0
+        actual_total = float(np.sum(y_true))
+        pred_total = float(np.sum(y_pred))
+        signed_total_error = pred_total - actual_total
         rows.append(
             {
                 "model_name": model_name,
@@ -129,8 +170,12 @@ def _monthly_metrics(evaluation: pd.DataFrame) -> pd.DataFrame:
                 "smape": float(
                     np.mean(2.0 * np.abs(y_true[valid] - y_pred[valid]) / denominator[valid]) if valid.any() else 0.0
                 ),
-                "actual_total": float(np.sum(y_true)),
-                "pred_total": float(np.sum(y_pred)),
+                "actual_total": actual_total,
+                "pred_total": pred_total,
+                "signed_total_error": signed_total_error,
+                "abs_total_error": abs(signed_total_error),
+                "total_pct_error": float(signed_total_error / actual_total) if actual_total > 0 else np.nan,
+                "total_abs_pct_error": float(abs(signed_total_error) / actual_total) if actual_total > 0 else np.nan,
             }
         )
     return pd.DataFrame(rows).sort_values(["target_month", "model_name"]).reset_index(drop=True)
@@ -138,16 +183,18 @@ def _monthly_metrics(evaluation: pd.DataFrame) -> pd.DataFrame:
 
 def plot_model_summary(summary: pd.DataFrame, plots_dir: Path) -> None:
     ordered = summary.copy()
-    ordered["model_name"] = pd.Categorical(ordered["model_name"], categories=MODEL_ORDER, ordered=True)
+    model_order = _resolve_model_order(ordered["model_name"].astype(str).tolist())
+    model_colors = _resolve_model_colors(model_order)
+    ordered["model_name"] = pd.Categorical(ordered["model_name"], categories=model_order, ordered=True)
     ordered = ordered.sort_values("model_name")
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
     for axis, metric in zip(axes, ["mae", "rmse", "smape"], strict=True):
         values = ordered[metric].to_numpy(dtype=float)
         bars = axis.bar(
-            [MODEL_LABELS[name] for name in ordered["model_name"]],
+            [_label_for_model(str(name)) for name in ordered["model_name"]],
             values,
-            color=[MODEL_COLORS[name] for name in ordered["model_name"]],
+            color=[model_colors[str(name)] for name in ordered["model_name"]],
             width=0.62,
         )
         axis.set_title(f"Backtest {METRIC_LABELS[metric]}")
@@ -170,21 +217,24 @@ def plot_model_summary(summary: pd.DataFrame, plots_dir: Path) -> None:
 def plot_monthly_metrics(monthly: pd.DataFrame, plots_dir: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharex=True)
     months = sorted(monthly["target_month"].astype(str).unique())
+    month_labels = [_format_month_label(month) for month in months]
+    model_order = _resolve_model_order(monthly["model_name"].astype(str).tolist())
+    model_colors = _resolve_model_colors(model_order)
 
     for axis, metric in zip(axes, ["mae", "rmse", "smape"], strict=True):
-        for model_name in MODEL_ORDER:
+        for model_name in model_order:
             subset = monthly[monthly["model_name"] == model_name].sort_values("target_month")
             axis.plot(
-                subset["target_month"],
+                [_format_month_label(month) for month in subset["target_month"]],
                 subset[metric],
                 marker="o",
                 linewidth=2.2,
                 markersize=6,
-                color=MODEL_COLORS[model_name],
-                label=MODEL_LABELS[model_name],
+                color=model_colors[model_name],
+                label=_label_for_model(model_name),
             )
         axis.set_title(f"Monthly {METRIC_LABELS[metric]}")
-        axis.set_xticks(months)
+        axis.set_xticks(month_labels)
         axis.tick_params(axis="x", rotation=25)
 
     axes[0].legend(frameon=True)
@@ -199,10 +249,12 @@ def plot_total_sales(monthly: pd.DataFrame, plots_dir: Path) -> None:
         .sort_values("target_month")
         .reset_index(drop=True)
     )
+    model_order = _resolve_model_order(monthly["model_name"].astype(str).tolist())
+    model_colors = _resolve_model_colors(model_order)
 
     fig, axis = plt.subplots(figsize=(10.5, 5.2))
     axis.plot(
-        actual["target_month"],
+        [_format_month_label(month) for month in actual["target_month"]],
         actual["actual_total"],
         marker="o",
         linewidth=2.6,
@@ -210,16 +262,16 @@ def plot_total_sales(monthly: pd.DataFrame, plots_dir: Path) -> None:
         color="#111111",
         label="Actual Total Sales",
     )
-    for model_name in MODEL_ORDER:
+    for model_name in model_order:
         subset = monthly[monthly["model_name"] == model_name].sort_values("target_month")
         axis.plot(
-            subset["target_month"],
+            [_format_month_label(month) for month in subset["target_month"]],
             subset["pred_total"],
             marker="o",
             linewidth=2.2,
             markersize=6,
-            color=MODEL_COLORS[model_name],
-            label=f"{MODEL_LABELS[model_name]} Predicted",
+            color=model_colors[model_name],
+            label=f"{_label_for_model(model_name)} Predicted",
         )
 
     axis.set_title("Total Sales by Target Month")
@@ -228,8 +280,111 @@ def plot_total_sales(monthly: pd.DataFrame, plots_dir: Path) -> None:
     _save_figure(fig, plots_dir / "03_total_sales.png")
 
 
+def plot_monthly_error_trend(monthly: pd.DataFrame, plots_dir: Path, metric: str = "smape") -> None:
+    model_order = _resolve_model_order(monthly["model_name"].astype(str).tolist())
+    model_colors = _resolve_model_colors(model_order)
+    month_order = sorted(monthly["target_month"].astype(str).unique())
+    month_labels = [_format_month_label(month) for month in month_order]
+
+    fig, axis = plt.subplots(figsize=(10.8, 5.2))
+    for model_name in model_order:
+        subset = monthly[monthly["model_name"] == model_name].sort_values("target_month")
+        values = subset[metric].astype(float).to_numpy() * 100.0 if metric == "smape" else subset[metric].astype(float)
+        axis.plot(
+            [_format_month_label(month) for month in subset["target_month"]],
+            values,
+            marker="o",
+            linewidth=2.4,
+            markersize=6,
+            color=model_colors[model_name],
+            label=_label_for_model(model_name),
+        )
+
+    axis.set_title("Monthly Forecast Error Trend by Model")
+    axis.set_xlabel("Target Month")
+    axis.set_ylabel("sMAPE (%)" if metric == "smape" else METRIC_LABELS.get(metric, metric.upper()))
+    axis.set_xticks(month_labels)
+    axis.tick_params(axis="x", rotation=20)
+    if metric == "smape":
+        axis.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=100, decimals=0))
+    axis.legend(frameon=True, ncol=2)
+    _save_figure(fig, plots_dir / f"07_monthly_{metric}_trend.png")
+
+
+def export_monthly_error_tables(monthly: pd.DataFrame, output_dir: Path) -> None:
+    export = monthly.copy()
+    export["month_label"] = export["target_month"].astype(str).map(_format_month_label)
+    export["model_label"] = export["model_name"].astype(str).map(_label_for_model)
+    export = export[
+        [
+            "target_month",
+            "month_label",
+            "model_name",
+            "model_label",
+            "actual_total",
+            "pred_total",
+            "signed_total_error",
+            "abs_total_error",
+            "total_pct_error",
+            "total_abs_pct_error",
+            "mae",
+            "rmse",
+            "smape",
+        ]
+    ].sort_values(["target_month", "smape", "mae", "model_name"])
+    export.to_csv(output_dir / "monthly_error_summary.csv", index=False, encoding="utf-8-sig")
+
+    best_by_month = (
+        export.sort_values(["target_month", "smape", "mae", "abs_total_error", "model_name"])
+        .groupby("target_month", as_index=False)
+        .first()
+    )
+    best_by_month.to_csv(output_dir / "monthly_best_model.csv", index=False, encoding="utf-8-sig")
+
+
+def plot_monthly_actual_vs_pred(monthly: pd.DataFrame, plots_dir: Path) -> None:
+    model_order = _resolve_model_order(monthly["model_name"].astype(str).tolist())
+    model_colors = _resolve_model_colors(model_order)
+
+    for target_month in sorted(monthly["target_month"].astype(str).unique()):
+        subset = monthly[monthly["target_month"].astype(str) == target_month].copy()
+        subset["model_name"] = pd.Categorical(subset["model_name"], categories=model_order, ordered=True)
+        subset = subset.sort_values("model_name")
+
+        actual_total = float(subset["actual_total"].iloc[0])
+        labels = ["Actual"] + [_label_for_model(str(name)) for name in subset["model_name"]]
+        values = [actual_total] + subset["pred_total"].astype(float).tolist()
+        colors = ["#111111"] + [model_colors[str(name)] for name in subset["model_name"]]
+
+        fig, axis = plt.subplots(figsize=(10.5, 5.4))
+        bars = axis.bar(labels, values, color=colors, width=0.62)
+        axis.axhline(actual_total, color="#111111", linestyle="--", linewidth=1.2, alpha=0.6)
+        axis.set_title(f"Actual vs Predicted Total Sales ({_format_month_label(target_month)})")
+        axis.set_ylabel("Sales")
+        axis.tick_params(axis="x", rotation=15)
+
+        max_value = max(values) if values else 0.0
+        axis.set_ylim(0, max_value * 1.18 if max_value > 0 else 1.0)
+
+        for index, (bar, value) in enumerate(zip(bars, values, strict=True)):
+            label = f"{value:,.0f}"
+            if index > 0 and actual_total > 0:
+                label = f"{label}\n{((value - actual_total) / actual_total):+.1%}"
+            axis.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+        _save_figure(fig, plots_dir / f"06_monthly_actual_vs_pred_{target_month}.png")
+
+
 def plot_paper_ic(paper_selection: pd.DataFrame, plots_dir: Path) -> None:
     selection = paper_selection.copy().sort_values(["forecast_target_month", "factor_count"])
+    criterion_column = "bic_rho2" if "bic_rho2" in selection.columns else "ic_rho2"
     months = selection["forecast_target_month"].astype(str).unique().tolist()
     if not months:
         return
@@ -243,7 +398,7 @@ def plot_paper_ic(paper_selection: pd.DataFrame, plots_dir: Path) -> None:
         subset = selection[selection["forecast_target_month"].astype(str) == month]
         axis.plot(
             subset["factor_count"],
-            subset["ic_rho2"],
+            subset[criterion_column],
             color=MODEL_COLORS["paper_inspired_factor"],
             linewidth=2.2,
             marker="o",
@@ -252,22 +407,22 @@ def plot_paper_ic(paper_selection: pd.DataFrame, plots_dir: Path) -> None:
         if not selected.empty:
             axis.scatter(
                 selected["factor_count"],
-                selected["ic_rho2"],
+                selected[criterion_column],
                 s=90,
                 color="#111111",
                 zorder=3,
                 label=f"Selected: {int(selected.iloc[0]['selected_factor_count'])}",
             )
             axis.legend(frameon=True, loc="best")
-        axis.set_title(f"Paper IC by Factor Count ({month})")
+        axis.set_title(f"Paper BIC by Factor Count ({month})")
         axis.set_xlabel("Factor Count")
-        axis.set_ylabel("IC (rho2)")
+        axis.set_ylabel("BIC-type criterion (rho2)")
         axis.set_xticks(subset["factor_count"].tolist())
 
     for axis in flat_axes[len(months) :]:
         axis.axis("off")
 
-    fig.suptitle("Paper Track Factor Selection in Backtest", fontsize=15, y=1.01)
+    fig.suptitle("Paper Track BIC-Type Factor Selection in Backtest", fontsize=15, y=1.01)
     _save_figure(fig, plots_dir / "04_paper_ic.png")
 
 
@@ -348,10 +503,13 @@ def generate_report_visuals(project_root: str | Path | None = None, plots_dir: s
     _apply_style()
     frames = _load_reporting_frames(output_dir)
     monthly = _monthly_metrics(frames.evaluation)
+    export_monthly_error_tables(monthly, output_dir)
 
     plot_model_summary(frames.summary, target_plots_dir)
     plot_monthly_metrics(monthly, target_plots_dir)
     plot_total_sales(monthly, target_plots_dir)
+    plot_monthly_error_trend(monthly, target_plots_dir, metric="smape")
+    plot_monthly_actual_vs_pred(monthly, target_plots_dir)
     plot_paper_ic(frames.paper_selection, target_plots_dir)
     plot_paper_fit(frames.paper_fitted, frames.paper_fit_summary, target_plots_dir)
 

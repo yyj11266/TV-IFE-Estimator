@@ -1,4 +1,4 @@
-"""Local LLS + local PCA forecaster with IC-based factor selection."""
+"""Local LLS + local PCA forecaster with BIC-type factor selection."""
 
 from __future__ import annotations
 
@@ -48,6 +48,14 @@ def _bounded_linear_extrapolation(values: np.ndarray, indices: np.ndarray) -> fl
     y_max = float(y.max())
     span = max(y_max - y_min, 1e-6)
     return float(np.clip(prediction, y_min - 0.5 * span, y_max + 0.5 * span))
+
+
+def _damped_bounded_linear_extrapolation(values: np.ndarray, indices: np.ndarray, damping: float) -> float:
+    if len(values) == 0:
+        return 0.0
+    last_value = float(values[-1])
+    raw_prediction = _bounded_linear_extrapolation(values, indices)
+    return float(last_value + float(damping) * (raw_prediction - last_value))
 
 
 def _bounded_ar1_forecast(series: np.ndarray) -> float:
@@ -103,8 +111,22 @@ class _TVIFEFitState:
     loadings: np.ndarray
     fitted: np.ndarray
     residual_variance: float
-    ic_rho1: float
-    ic_rho2: float
+    log_residual_variance: float
+    bic_penalty_rho1: float
+    bic_penalty_rho2: float
+    bic_rho1: float
+    bic_rho2: float
+
+
+@dataclass
+class _TVIFEPanelInputs:
+    y: np.ndarray
+    design: np.ndarray
+    source_months: list[str]
+    source_month_index: np.ndarray
+    family_ids: list[str]
+    feature_means: np.ndarray
+    max_target_log_sales: float
 
 
 @dataclass
@@ -120,7 +142,7 @@ class PaperTrackArtifacts:
 
 
 class PaperInspiredFactorForecaster:
-    """A fuller TV-IFE estimator based on local LLS + local PCA + IC."""
+    """A fuller TV-IFE estimator based on local LLS + local PCA + BIC-type factor selection."""
 
     model_name = "paper_inspired_factor"
 
@@ -133,9 +155,12 @@ class PaperInspiredFactorForecaster:
         ic_penalty_variant: str = "rho2",
         ridge_alpha: float = 1e-6,
         bandwidth_scale: float = 0.5,
+        bandwidth_method: str = "response_std",
+        bandwidth_pilot_scale: float = 2.0,
         min_window: float = 2.0,
         max_iter: int = 50,
         tolerance: float = 1e-6,
+        loading_extrapolation_damping: float = 0.1,
     ) -> None:
         self.n_factors = n_factors
         self.factor_candidates = tuple(sorted({int(value) for value in factor_candidates if int(value) >= 0}))
@@ -143,9 +168,12 @@ class PaperInspiredFactorForecaster:
         self.ic_penalty_variant = ic_penalty_variant
         self.ridge_alpha = ridge_alpha
         self.bandwidth_scale = bandwidth_scale
+        self.bandwidth_method = str(bandwidth_method)
+        self.bandwidth_pilot_scale = float(bandwidth_pilot_scale)
         self.min_window = min_window
         self.max_iter = max_iter
         self.tolerance = tolerance
+        self.loading_extrapolation_damping = float(loading_extrapolation_damping)
 
         self.feature_columns = list(feature_columns or CORE_PAPER_NUMERIC_FEATURES)
 
@@ -153,8 +181,19 @@ class PaperInspiredFactorForecaster:
         self.state_: _TVIFEFitState | None = None
         self.selection_table_: pd.DataFrame | None = None
         self.selected_factor_count_: int | None = None
+        self.pilot_bandwidth_: float | None = None
+        self.estimated_error_std_: float | None = None
 
-    def _prepare_panel(self, frame: pd.DataFrame) -> _TVIFEPanel:
+        if self.ic_penalty_variant not in {"rho1", "rho2"}:
+            raise ValueError("ic_penalty_variant must be one of {'rho1', 'rho2'}.")
+        if self.bandwidth_method not in {"response_std", "paper_residual"}:
+            raise ValueError("bandwidth_method must be one of {'response_std', 'paper_residual'}.")
+        if self.bandwidth_pilot_scale <= 0.0:
+            raise ValueError("bandwidth_pilot_scale must be positive.")
+        if not 0.0 <= self.loading_extrapolation_damping <= 1.0:
+            raise ValueError("loading_extrapolation_damping must be between 0.0 and 1.0.")
+
+    def _prepare_panel_inputs(self, frame: pd.DataFrame) -> _TVIFEPanelInputs:
         train = frame.copy().sort_values(["source_month_index", "family_id"]).reset_index(drop=True)
         family_ids = sorted(train["family_id"].astype(str).unique())
         source_month_index = np.array(sorted(train["source_month_index"].dropna().astype(int).unique()), dtype=float)
@@ -189,43 +228,85 @@ class PaperInspiredFactorForecaster:
         x = np.stack(feature_matrices, axis=2)
         intercept = np.ones((x.shape[0], x.shape[1], 1), dtype=float)
         design = np.concatenate([intercept, x], axis=2)
-
-        sigma_hat = float(np.std(y)) if y.size else 0.0
-        bandwidth = max(
-            self.min_window / max(len(source_month_index), 1),
-            self.bandwidth_scale
-            * (2.35 / math.sqrt(12.0))
-            * max(sigma_hat, 1e-8)
-            * (max(len(source_month_index) * len(family_ids), 1) ** (-2.0 / 9.0)),
-        )
-
-        positions = np.arange(len(source_month_index), dtype=float)
-        kernel_weights = np.vstack(
-            [
-                _epanechnikov_weights((positions - target_index) / max(len(source_month_index) * bandwidth, _EPSILON))
-                for target_index in positions
-            ]
-        )
-
-        return _TVIFEPanel(
+        return _TVIFEPanelInputs(
             y=y,
             design=design,
             source_months=source_months,
             source_month_index=source_month_index,
             family_ids=family_ids,
             feature_means=np.array(feature_means, dtype=float),
-            bandwidth=bandwidth,
-            kernel_weights=kernel_weights,
             max_target_log_sales=float(np.max(y)),
         )
+
+    @staticmethod
+    def _bandwidth_rate(n_months: int, n_families: int) -> float:
+        return (2.35 / math.sqrt(12.0)) * (max(n_months * n_families, 1) ** (-2.0 / 9.0))
+
+    def _minimum_bandwidth(self, n_months: int) -> float:
+        return self.min_window / max(n_months, 1)
+
+    def _build_panel(self, inputs: _TVIFEPanelInputs, bandwidth: float) -> _TVIFEPanel:
+        positions = np.arange(len(inputs.source_month_index), dtype=float)
+        kernel_weights = np.vstack(
+            [
+                _epanechnikov_weights((positions - target_index) / max(len(inputs.source_month_index) * bandwidth, _EPSILON))
+                for target_index in positions
+            ]
+        )
+        return _TVIFEPanel(
+            y=inputs.y,
+            design=inputs.design,
+            source_months=inputs.source_months,
+            source_month_index=inputs.source_month_index,
+            family_ids=inputs.family_ids,
+            feature_means=inputs.feature_means,
+            bandwidth=bandwidth,
+            kernel_weights=kernel_weights,
+            max_target_log_sales=inputs.max_target_log_sales,
+        )
+
+    def _select_bandwidth(self, inputs: _TVIFEPanelInputs) -> tuple[float, float | None, float | None]:
+        n_months = len(inputs.source_month_index)
+        n_families = len(inputs.family_ids)
+        base_rate = self._bandwidth_rate(n_months, n_families)
+        minimum_bandwidth = self._minimum_bandwidth(n_months)
+        if self.bandwidth_method == "response_std":
+            response_std = float(np.std(inputs.y)) if inputs.y.size else 0.0
+            bandwidth = max(
+                minimum_bandwidth,
+                self.bandwidth_scale * max(response_std, _EPSILON) * base_rate,
+            )
+            return bandwidth, None, response_std
+
+        # Follow the paper's two-step logic: use a pilot undersmoothing bandwidth,
+        # estimate the idiosyncratic error scale from pilot residuals, then rescale h.
+        pilot_bandwidth = max(
+            minimum_bandwidth,
+            self.bandwidth_pilot_scale * self.bandwidth_scale * base_rate,
+        )
+        pilot_panel = self._build_panel(inputs, pilot_bandwidth)
+        pilot_state, _, _ = self._fit_panel(pilot_panel)
+        pilot_residual = pilot_panel.y - pilot_state.fitted
+        estimated_error_std = float(np.sqrt(np.mean(pilot_residual**2))) if pilot_residual.size else 0.0
+        bandwidth = max(
+            minimum_bandwidth,
+            self.bandwidth_scale * max(estimated_error_std, _EPSILON) * base_rate,
+        )
+        return bandwidth, pilot_bandwidth, estimated_error_std
+
+    def _prepare_panel(self, frame: pd.DataFrame) -> _TVIFEPanel:
+        inputs = self._prepare_panel_inputs(frame)
+        bandwidth, pilot_bandwidth, estimated_error_std = self._select_bandwidth(inputs)
+        self.pilot_bandwidth_ = pilot_bandwidth
+        self.estimated_error_std_ = estimated_error_std
+        return self._build_panel(inputs, bandwidth)
 
     def _candidate_factor_counts(self, panel: _TVIFEPanel) -> list[int]:
         if self.n_factors is not None:
             return [max(int(self.n_factors), 0)]
 
         max_rank = max(min(panel.n_months, panel.n_families) - 1, 0)
-        effective_cap = max(int(math.floor(panel.n_months * panel.bandwidth)) - 1, 0)
-        derived_cap = min(max_rank, effective_cap, self.max_factor_count)
+        derived_cap = min(max_rank, self.max_factor_count)
         if self.factor_candidates:
             valid = sorted({value for value in self.factor_candidates if value <= derived_cap})
             if 0 not in valid:
@@ -362,7 +443,12 @@ class PaperInspiredFactorForecaster:
 
         return beta_bc
 
-    def _information_criteria(self, residual_variance: float, factor_count: int, panel: _TVIFEPanel) -> tuple[float, float]:
+    def _information_criteria(
+        self,
+        residual_variance: float,
+        factor_count: int,
+        panel: _TVIFEPanel,
+    ) -> tuple[float, float, float, float, float]:
         effective_time = max(panel.n_months * panel.bandwidth, 1.0)
         rho_nt_1 = (
             (panel.n_families + effective_time)
@@ -376,9 +462,14 @@ class PaperInspiredFactorForecaster:
             * math.log(max(c_nt ** 2, 1.0 + _EPSILON))
         )
         log_variance = math.log(max(residual_variance, 1e-12))
+        bic_penalty_rho1 = factor_count * rho_nt_1
+        bic_penalty_rho2 = factor_count * rho_nt_2
         return (
-            log_variance + factor_count * rho_nt_1,
-            log_variance + factor_count * rho_nt_2,
+            log_variance,
+            bic_penalty_rho1,
+            bic_penalty_rho2,
+            log_variance + bic_penalty_rho1,
+            log_variance + bic_penalty_rho2,
         )
 
     def _fit_fixed_factor_count(self, panel: _TVIFEPanel, factor_count: int) -> _TVIFEFitState:
@@ -431,7 +522,13 @@ class PaperInspiredFactorForecaster:
         factors_bc = self._second_stage_factors(panel, beta_bc, loadings)
         fitted = self._compute_fitted(panel, beta_bc, loadings, factors_bc)
         residual_variance = float(np.mean((panel.y - fitted) ** 2))
-        ic_rho1, ic_rho2 = self._information_criteria(
+        (
+            log_residual_variance,
+            bic_penalty_rho1,
+            bic_penalty_rho2,
+            bic_rho1,
+            bic_rho2,
+        ) = self._information_criteria(
             residual_variance=residual_variance,
             factor_count=factor_count,
             panel=panel,
@@ -445,35 +542,50 @@ class PaperInspiredFactorForecaster:
             loadings=loadings,
             fitted=fitted,
             residual_variance=residual_variance,
-            ic_rho1=ic_rho1,
-            ic_rho2=ic_rho2,
+            log_residual_variance=log_residual_variance,
+            bic_penalty_rho1=bic_penalty_rho1,
+            bic_penalty_rho2=bic_penalty_rho2,
+            bic_rho1=bic_rho1,
+            bic_rho2=bic_rho2,
         )
+
+    def _fit_panel(self, panel: _TVIFEPanel) -> tuple[_TVIFEFitState, pd.DataFrame, int]:
+        candidate_factor_counts = self._candidate_factor_counts(panel)
+        states = [self._fit_fixed_factor_count(panel, factor_count) for factor_count in candidate_factor_counts]
+
+        selection_rows = []
+        for state in states:
+            effective_window = panel.n_months * panel.bandwidth
+            c_nt = min(math.sqrt(max(effective_window, 1.0)), math.sqrt(panel.n_families), panel.bandwidth ** -2)
+            selection_rows.append(
+                {
+                    "factor_count": state.factor_count,
+                    "residual_variance": state.residual_variance,
+                    "log_residual_variance": state.log_residual_variance,
+                    "bic_penalty_rho1": state.bic_penalty_rho1,
+                    "bic_penalty_rho2": state.bic_penalty_rho2,
+                    "bic_rho1": state.bic_rho1,
+                    "bic_rho2": state.bic_rho2,
+                    "ic_rho1": state.bic_rho1,
+                    "ic_rho2": state.bic_rho2,
+                    "effective_window": effective_window,
+                    "c_nt": c_nt,
+                    "bandwidth": panel.bandwidth,
+                }
+            )
+        selection = pd.DataFrame(selection_rows).sort_values("factor_count").reset_index(drop=True)
+        criterion_column = "bic_rho2" if self.ic_penalty_variant == "rho2" else "bic_rho1"
+        best_row = selection.sort_values([criterion_column, "factor_count"]).iloc[0]
+        selected_factor_count = int(best_row["factor_count"])
+        selected_state = next(state for state in states if state.factor_count == selected_factor_count)
+        return selected_state, selection, selected_factor_count
 
     def fit(self, frame: pd.DataFrame) -> "PaperInspiredFactorForecaster":
         if frame.empty:
             raise ValueError("Paper-inspired model cannot fit an empty frame.")
 
         panel = self._prepare_panel(frame)
-        candidate_factor_counts = self._candidate_factor_counts(panel)
-        states = [self._fit_fixed_factor_count(panel, factor_count) for factor_count in candidate_factor_counts]
-
-        selection_rows = []
-        for state in states:
-            selection_rows.append(
-                {
-                    "factor_count": state.factor_count,
-                    "residual_variance": state.residual_variance,
-                    "ic_rho1": state.ic_rho1,
-                    "ic_rho2": state.ic_rho2,
-                    "effective_window": panel.n_months * panel.bandwidth,
-                    "bandwidth": panel.bandwidth,
-                }
-            )
-        selection = pd.DataFrame(selection_rows).sort_values("factor_count").reset_index(drop=True)
-        criterion_column = "ic_rho2" if self.ic_penalty_variant == "rho2" else "ic_rho1"
-        best_row = selection.sort_values([criterion_column, "factor_count"]).iloc[0]
-        selected_factor_count = int(best_row["factor_count"])
-        selected_state = next(state for state in states if state.factor_count == selected_factor_count)
+        selected_state, selection, selected_factor_count = self._fit_panel(panel)
 
         self.panel_ = panel
         self.state_ = selected_state
@@ -513,9 +625,10 @@ class PaperInspiredFactorForecaster:
                     continue
                 loading_next = np.array(
                     [
-                        _bounded_linear_extrapolation(
+                        _damped_bounded_linear_extrapolation(
                             self.state_.loadings[:, family_index, factor_index],
                             self.panel_.source_month_index,
+                            self.loading_extrapolation_damping,
                         )
                         for factor_index in range(factor_count)
                     ],
@@ -572,7 +685,7 @@ class PaperInspiredFactorForecaster:
 
         selection = self.selection_table_.copy()
         selection["selected_factor_count"] = self.selected_factor_count_
-        selection["criterion_used"] = self.ic_penalty_variant
+        selection["criterion_used"] = f"bic_{self.ic_penalty_variant}"
 
         fitted_rows = []
         fitted_sales = np.expm1(np.clip(self.state_.fitted, 0.0, None))
@@ -602,12 +715,21 @@ class PaperInspiredFactorForecaster:
                 {
                     "selected_factor_count": self.selected_factor_count_,
                     "bandwidth": self.panel_.bandwidth,
+                    "bandwidth_method": self.bandwidth_method,
+                    "bandwidth_scale": self.bandwidth_scale,
+                    "bandwidth_pilot_scale": self.bandwidth_pilot_scale,
+                    "pilot_bandwidth": self.pilot_bandwidth_,
+                    "estimated_error_std": self.estimated_error_std_,
                     "residual_variance": self.state_.residual_variance,
                     "in_sample_mae": float(np.mean(np.abs(observed - fitted_values))),
                     "in_sample_rmse": float(np.sqrt(np.mean((observed - fitted_values) ** 2))),
                     "in_sample_smape": float(
                         np.mean(2.0 * np.abs(observed[valid] - fitted_values[valid]) / denominator[valid]) if valid.any() else 0.0
                     ),
+                    "coefficient_extrapolation": "bounded_linear_last3",
+                    "factor_extrapolation": "bounded_ar1",
+                    "loading_extrapolation": "damped_bounded_linear_last3",
+                    "loading_extrapolation_damping": self.loading_extrapolation_damping,
                     "n_panel_rows": int(len(fitted_frame)),
                 }
             ]

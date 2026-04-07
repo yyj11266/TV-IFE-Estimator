@@ -12,6 +12,7 @@ from .config import PipelineConfig
 from .models.baselines import NaiveLastMonthModel
 from .models.direct import DirectRidgeForecaster
 from .models.paper_proxy import PaperInspiredFactorForecaster
+from .models.predictive_tv import LaunchAwarePredictiveTVForecaster
 
 
 @dataclass
@@ -106,10 +107,13 @@ def _fit_paper_model(
         ic_penalty_variant=config.paper_ic_penalty_variant,
         ridge_alpha=config.paper_model_alpha,
         bandwidth_scale=config.paper_bandwidth_scale,
+        bandwidth_method=config.paper_bandwidth_method,
+        bandwidth_pilot_scale=config.paper_bandwidth_pilot_scale,
         min_window=config.paper_min_window,
     ).fit(train_frame)
     records = model.selection_table_.to_dict(orient="records") if model.selection_table_ is not None else []
     for record in records:
+        record["criterion_used"] = f"bic_{config.paper_ic_penalty_variant}"
         record["selected_factor_count"] = model.selected_factor_count_
         record["selected"] = int(record["factor_count"] == model.selected_factor_count_)
     return model, records
@@ -118,18 +122,27 @@ def _fit_paper_model(
 def _fit_predictive_tv_ife_model(
     train_frame: pd.DataFrame,
     config: PipelineConfig,
-) -> PaperInspiredFactorForecaster:
-    model = PaperInspiredFactorForecaster(
-        n_factors=config.predictive_tv_ife_n_factors,
-        feature_columns=config.predictive_tv_ife_feature_columns,
+) -> LaunchAwarePredictiveTVForecaster:
+    model = LaunchAwarePredictiveTVForecaster(
+        launch_feature_columns=config.predictive_tv_ife_feature_columns,
+        mature_feature_columns=config.predictive_tv_ife_mature_feature_columns,
+        mature_feature_candidates=config.predictive_tv_ife_mature_feature_candidates,
         factor_candidates=config.factor_candidates,
         max_factor_count=config.paper_max_factor_count,
         ic_penalty_variant=config.paper_ic_penalty_variant,
         ridge_alpha=config.predictive_tv_ife_ridge_alpha,
         bandwidth_scale=config.predictive_tv_ife_bandwidth_scale,
+        bandwidth_method=config.predictive_tv_ife_bandwidth_method,
+        bandwidth_pilot_scale=config.predictive_tv_ife_bandwidth_pilot_scale,
         min_window=config.paper_min_window,
+        n_factors=config.predictive_tv_ife_n_factors,
+        mature_history_threshold=config.predictive_tv_ife_mature_history_threshold,
+        mature_history_threshold_candidates=config.predictive_tv_ife_mature_history_threshold_candidates,
+        mature_blend_weight=config.predictive_tv_ife_mature_blend_weight,
+        mature_blend_weight_candidates=config.predictive_tv_ife_mature_blend_weight_candidates,
+        enable_inner_validation=config.predictive_tv_ife_enable_inner_validation,
+        inner_validation_min_months=config.predictive_tv_ife_inner_validation_min_months,
     ).fit(train_frame)
-    model.model_name = "tv_ife_predictive_augmented"
     return model
 
 
@@ -179,6 +192,16 @@ def run_backtest(
             predictive_tv_model.predict(direct_test),
         )
         predictive_fold_result["selected_factor_count"] = predictive_tv_model.selected_factor_count_
+        predictive_fold_result["selected_launch_factor_count"] = predictive_tv_model.selected_launch_factor_count_
+        predictive_fold_result["selected_mature_factor_count"] = predictive_tv_model.selected_mature_factor_count_
+        predictive_fold_result["selected_mature_feature_columns"] = ",".join(
+            predictive_tv_model.selected_mature_feature_columns_
+        )
+        predictive_fold_result["selected_mature_history_threshold"] = (
+            predictive_tv_model.selected_mature_history_threshold_
+        )
+        predictive_fold_result["selected_mature_blend_weight"] = predictive_tv_model.selected_mature_blend_weight_
+        predictive_fold_result["parameter_source"] = predictive_tv_model.parameter_source_
         evaluation_rows.append(predictive_fold_result)
 
     evaluation = pd.concat(evaluation_rows, ignore_index=True)
@@ -200,7 +223,7 @@ def fit_final_models_and_forecast(
     config: PipelineConfig,
     paper_n_factors: int | None = None,
     paper_feature_columns: tuple[str, ...] | None = None,
-) -> tuple[pd.DataFrame, PaperInspiredFactorForecaster, PaperInspiredFactorForecaster]:
+) -> tuple[pd.DataFrame, PaperInspiredFactorForecaster, LaunchAwarePredictiveTVForecaster]:
     """Fit final models on all available data and forecast the next target month."""
 
     naive_model = NaiveLastMonthModel().fit(direct_training_frame)
@@ -249,6 +272,14 @@ def fit_final_models_and_forecast(
             output["selected_factor_count"] = paper_model.selected_factor_count_
         if model_name == predictive_tv_model.model_name:
             output["selected_factor_count"] = predictive_tv_model.selected_factor_count_
+            output["selected_launch_factor_count"] = predictive_tv_model.selected_launch_factor_count_
+            output["selected_mature_factor_count"] = predictive_tv_model.selected_mature_factor_count_
+            output["selected_mature_feature_columns"] = ",".join(
+                predictive_tv_model.selected_mature_feature_columns_
+            )
+            output["selected_mature_history_threshold"] = predictive_tv_model.selected_mature_history_threshold_
+            output["selected_mature_blend_weight"] = predictive_tv_model.selected_mature_blend_weight_
+            output["parameter_source"] = predictive_tv_model.parameter_source_
         forecast_rows.append(output)
 
     final_forecast = pd.concat(forecast_rows, ignore_index=True)

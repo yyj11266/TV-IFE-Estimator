@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .backtest import BacktestArtifacts, fit_final_models_and_forecast, run_backtest
+from .backtest import BacktestArtifacts, fit_final_models_and_forecast, run_backtest, summarize_evaluation
 from .config import PipelineConfig, ProjectPaths, default_paths
 from .features import (
     build_direct_forecast_frame,
@@ -95,6 +95,18 @@ def _write_outputs(
         paths.output_dir / "paper_empirical_recommendation.csv",
     )
     _save_csv(
+        artifacts.paper_empirical_study.predictive_tv_sensitivity_summary,
+        paths.output_dir / "predictive_tv_ife_factor_sensitivity_summary.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.predictive_tv_sensitivity_fold_results,
+        paths.output_dir / "predictive_tv_ife_factor_sensitivity_folds.csv",
+    )
+    _save_csv(
+        artifacts.paper_empirical_study.predictive_tv_recommendation,
+        paths.output_dir / "predictive_tv_ife_factor_recommendation.csv",
+    )
+    _save_csv(
         artifacts.paper_empirical_study.predictive_summary,
         paths.output_dir / "paper_predictive_augmented_summary.csv",
     )
@@ -154,15 +166,20 @@ def run_pipeline(
 
     direct_training_frame = build_direct_training_frame(family_month_panel, family_static_profile)
     paper_training_frame = build_paper_training_frame(family_month_panel, family_static_profile)
-    paper_empirical_study = run_paper_empirical_study(paper_training_frame, config)
+    paper_empirical_study = run_paper_empirical_study(direct_training_frame, paper_training_frame, config)
     backtest = run_backtest(direct_training_frame, paper_training_frame, config)
-    recommendation_row = paper_empirical_study.recommendation.iloc[0]
-    recommended_feature_columns = tuple(
-        column.strip()
-        for column in str(recommendation_row["recommended_feature_columns"]).split(",")
-        if column.strip()
-    )
-    recommended_factor_mode = str(recommendation_row["recommended_factor_mode"])
+    backtest.summary = summarize_evaluation(backtest.evaluation)
+    configured_paper_signature = ",".join(config.paper_feature_columns)
+    configured_paper_recommendations = paper_empirical_study.sensitivity_summary[
+        paper_empirical_study.sensitivity_summary["feature_columns"].astype(str) == configured_paper_signature
+    ]
+    if configured_paper_recommendations.empty:
+        recommended_factor_mode = str(paper_empirical_study.recommendation.iloc[0]["recommended_factor_mode"])
+    else:
+        configured_recommendation_row = configured_paper_recommendations.sort_values(
+            ["smape", "rmse", "mae", "spec_name", "factor_mode"]
+        ).iloc[0]
+        recommended_factor_mode = str(configured_recommendation_row["factor_mode"])
     recommended_n_factors = (
         int(recommended_factor_mode.removeprefix("fixed_"))
         if recommended_factor_mode.startswith("fixed_")
@@ -180,7 +197,7 @@ def run_pipeline(
         next_target_month=next_target_month,
         config=config,
         paper_n_factors=recommended_n_factors,
-        paper_feature_columns=recommended_feature_columns,
+        paper_feature_columns=config.paper_feature_columns,
     )
 
     artifacts = PipelineArtifacts(

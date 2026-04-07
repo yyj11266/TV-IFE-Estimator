@@ -71,6 +71,9 @@ python -m tv_ife_estimator.report_viz
 - `outputs/paper_empirical_sensitivity_summary.csv`
 - `outputs/paper_empirical_sensitivity_folds.csv`
 - `outputs/paper_empirical_recommendation.csv`
+- `outputs/predictive_tv_ife_factor_sensitivity_summary.csv`
+- `outputs/predictive_tv_ife_factor_sensitivity_folds.csv`
+- `outputs/predictive_tv_ife_factor_recommendation.csv`
 - `outputs/paper_predictive_augmented_summary.csv`
 - `outputs/paper_predictive_augmented_recommendation.csv`
 - `outputs/paper_track_factors.csv`
