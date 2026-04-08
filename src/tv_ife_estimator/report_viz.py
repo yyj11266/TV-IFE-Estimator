@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .config import default_paths
+from .waterfall_viz import generate_waterfall_plot
 
 BASE_MODEL_ORDER = [
     "naive_last_month",
@@ -512,6 +513,13 @@ def generate_report_visuals(project_root: str | Path | None = None, plots_dir: s
     plot_monthly_actual_vs_pred(monthly, target_plots_dir)
     plot_paper_ic(frames.paper_selection, target_plots_dir)
     plot_paper_fit(frames.paper_fitted, frames.paper_fit_summary, target_plots_dir)
+    
+    # Generate Advanced Waterfall/Ridgeline plots
+    panel_f = output_dir / "family_month_panel.csv"
+    eval_f = output_dir / "forecast_eval.csv"
+    if panel_f.exists() and eval_f.exists():
+        generate_waterfall_plot(panel_f, eval_f, target_plots_dir / "08_waterfall_by_sales.png", sort_criterion='sales', top_n=10)
+        generate_waterfall_plot(panel_f, eval_f, target_plots_dir / "09_waterfall_by_error.png", sort_criterion='error', top_n=10)
 
     return sorted(target_plots_dir.glob("*.png"))
 
