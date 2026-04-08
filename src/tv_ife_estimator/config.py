@@ -38,6 +38,8 @@ class PipelineConfig:
 
     full_months: tuple[str, ...] = FULL_MONTHS
     target_months: tuple[str, ...] = DEFAULT_TARGET_MONTHS
+    family_filter_mode: str = "all"
+    family_filter_reference_month: str | None = None
     paper_feature_columns: tuple[str, ...] = (
         "log_prev_sales",
         "log_prev_prev_sales",

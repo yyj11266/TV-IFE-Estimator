@@ -19,6 +19,7 @@ from .features import (
 )
 from .io import SubsetValidationReport, load_enhanced_market, load_raw_market, validate_subset
 from .preprocessing import (
+    apply_family_filter,
     build_diagnostics,
     build_family_lookup,
     build_family_month_panel,
@@ -162,7 +163,19 @@ def run_pipeline(
     family_lookup = build_family_lookup(enhanced_market)
     family_static_profile = build_family_static_profile(enhanced_market, family_lookup)
     family_month_panel = build_family_month_panel(enhanced_market, family_lookup, config.full_months)
+    family_lookup, family_static_profile, family_month_panel, family_filter_report = apply_family_filter(
+        family_lookup,
+        family_static_profile,
+        family_month_panel,
+        mode=config.family_filter_mode,
+        reference_month=config.family_filter_reference_month,
+    )
     diagnostics = build_diagnostics(family_lookup, family_static_profile, family_month_panel)
+    diagnostics["family_filter_mode"] = family_filter_report.mode
+    diagnostics["family_filter_reference_month"] = family_filter_report.reference_month
+    diagnostics["family_filter_total_family_count"] = family_filter_report.total_family_count
+    diagnostics["family_filter_kept_family_count"] = family_filter_report.kept_family_count
+    diagnostics["family_filter_dropped_family_count"] = family_filter_report.dropped_family_count
 
     direct_training_frame = build_direct_training_frame(family_month_panel, family_static_profile)
     paper_training_frame = build_paper_training_frame(family_month_panel, family_static_profile)

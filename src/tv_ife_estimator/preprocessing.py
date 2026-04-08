@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import re
 from typing import Iterable
@@ -10,6 +11,17 @@ import numpy as np
 import pandas as pd
 
 from .constants import FULL_MONTHS, STATIC_CATEGORICAL_FIELDS, STATIC_NUMERIC_FIELDS, WIFI_GENERATION_MAP
+
+
+@dataclass(frozen=True)
+class FamilyFilterReport:
+    """Metadata describing the selected family scope."""
+
+    mode: str
+    reference_month: str | None
+    total_family_count: int
+    kept_family_count: int
+    dropped_family_count: int
 
 
 def clean_text(value: object) -> str | None:
@@ -82,6 +94,51 @@ def month_sort_key(month: str) -> int:
     """Sortable integer for YYYYMM strings."""
 
     return int(month)
+
+
+def apply_family_filter(
+    family_lookup: pd.DataFrame,
+    static_profile: pd.DataFrame,
+    month_panel: pd.DataFrame,
+    *,
+    mode: str = "all",
+    reference_month: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, FamilyFilterReport]:
+    """Restrict the dataset to a configurable family scope."""
+
+    normalized_mode = str(mode).strip().lower()
+    total_family_count = int(month_panel["family_id"].nunique())
+    resolved_reference_month = reference_month
+
+    if normalized_mode == "all":
+        kept_family_ids = month_panel["family_id"].astype(str).unique().tolist()
+    elif normalized_mode == "start_nonzero_only":
+        if resolved_reference_month is None:
+            resolved_reference_month = min(month_panel["month"].astype(str).unique(), key=month_sort_key)
+        reference_rows = month_panel[month_panel["month"].astype(str) == str(resolved_reference_month)].copy()
+        if reference_rows.empty:
+            raise ValueError(f"No rows found for family filter reference month {resolved_reference_month}.")
+        kept_family_ids = (
+            reference_rows.loc[reference_rows["sales"].astype(float) > 0, "family_id"].astype(str).drop_duplicates().tolist()
+        )
+    else:
+        raise ValueError(f"Unsupported family_filter_mode: {mode}")
+
+    family_id_set = set(kept_family_ids)
+    filtered_lookup = family_lookup[family_lookup["family_id"].astype(str).isin(family_id_set)].copy().reset_index(drop=True)
+    filtered_static = static_profile[static_profile["family_id"].astype(str).isin(family_id_set)].copy().reset_index(drop=True)
+    filtered_panel = month_panel[month_panel["family_id"].astype(str).isin(family_id_set)].copy().reset_index(drop=True)
+
+    report = FamilyFilterReport(
+        mode=normalized_mode,
+        reference_month=str(resolved_reference_month) if resolved_reference_month is not None else None,
+        total_family_count=total_family_count,
+        kept_family_count=int(filtered_panel["family_id"].nunique()),
+        dropped_family_count=int(total_family_count - filtered_panel["family_id"].nunique()),
+    )
+    if report.kept_family_count <= 0:
+        raise ValueError(f"Family filter mode {normalized_mode} removed every family.")
+    return filtered_lookup, filtered_static, filtered_panel, report
 
 
 def build_family_lookup(enhanced_market: pd.DataFrame) -> pd.DataFrame:

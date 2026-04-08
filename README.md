@@ -56,6 +56,12 @@ For ad hoc reporting visuals built from `outputs/*.csv`:
 python -m tv_ife_estimator.report_viz
 ```
 
+To rerun the full pipeline using only families that already had non-zero sales in the first full sample month:
+
+```bash
+tv-ife-estimator --family-filter-mode start_nonzero_only
+```
+
 ## Main Outputs
 
 - `outputs/family_lookup.csv`
